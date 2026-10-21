@@ -112,7 +112,7 @@ Before automating, check that the query returns the objects you expect.
    ```bash
    export APPS_PWD='********'
    cd /u01/fd_tools/aol
-   ./get_aol_list.sh 2026-10-01
+   ./get_aol_list.sh 2026-10-01 DEVEBS      # uses /DEVEBS_app/oracle/EBSapps.env
    ```
 3. Check `aol_objects.txt`. Each line should have the form `TYPE|APP|KEY`:
    ```
@@ -152,6 +152,9 @@ On the **Properties** tab. The values are set later on the instance or project.
 
 | Code | Scope | Encrypted | Example value |
 |---|---|---|---|
+| `EBS_DB_NAME` | Target | No | `DEVEBS`; used to build `/DEVEBS/oracle/EBSapps.env` (fallback if the endpoint name can't be used) |
+| `EBS_ENDPOINT_SEPARATOR` | Target | No | `-` (default); separator before the DB name in `<machinename>-<DBNAME>` endpoint names |
+| `EBS_DIR_SUFFIX` | Target | No | `_app` (default); appended to the DB name to form the folder, e.g. `DEVEBS_app` |
 | `AOL_TOOLS_DIR` | Target | No | `/u01/fd_tools/aol` |
 | `AOL_REPO_DIR` | Target | No | `/u01/fd_tools/aol_repo` |
 | `FD_API_URL` | Target | No | `https://fdhost:8443/flexdeploy/rest` |
@@ -159,7 +162,14 @@ On the **Properties** tab. The values are set later on the instance or project.
 | `EBS_PROJECT_ID` | Project | No | numeric ID of the EBS partial-deploy project |
 | `EBS_PROJECT_PATH` | Project | No | `/FlexDeploy/EBS/XXAP` |
 
-> The APPS password and EBS environment script already exist as EBS instance properties, so don't redefine them. All workflow execution properties are available to the shell as environment variables, and secure values are masked as `*****` in the logs.
+> The APPS password and EBS environment script already exist as EBS instance properties, so don't redefine them. The environment file follows the convention `/<database_name>/oracle/EBSapps.env`. Step 1 resolves it in this order:
+>
+> 1. **EBS Source Script** (`FDEBS_SOURCE_SCRIPT`) on the EBS instance, if set
+> 2. **Endpoint name postfix.** If FlexDeploy exposes the endpoint name to the shell (as `FD_ENDPOINT_NAME` or `FD_ENDPOINT_CODE`), the text after the last `-` is used as the DB name. Endpoints follow the convention `<machinename>-<DBNAME>`, and `_app` is appended (the `EBS_DIR_SUFFIX` property), e.g. `ebsapp01-DEVEBS` → `DEVEBS_app` → `/DEVEBS_app/oracle/EBSapps.env`. Hyphens inside the machine name are fine; the DB name itself must not contain a hyphen. Set the `EBS_ENDPOINT_SEPARATOR` property only if the convention changes.
+> 3. `/${EBS_DB_NAME}/oracle/EBSapps.env`, using the `EBS_DB_NAME` target property
+> 4. Auto-discovery, only when exactly one `/*/oracle/EBSapps.env` exists on the server
+>
+> **Before relying on option 2**, run a one-off shell step on the EBS endpoint with `env | grep '^FD_' | sort` to confirm which endpoint variable your FlexDeploy version provides. The documented execution variables include `FD_ENVIRONMENT_CODE` and `FD_INSTANCE_CODE`, but an endpoint-name variable is not documented. If none exists, use option 1 or 3. Don't rely on auto-discovery on servers that host multiple instances. All workflow execution properties are available to the shell as environment variables, and secure values are masked as `*****` in the logs.
 
 ### 6.3 Workflow variables
 
@@ -214,6 +224,7 @@ Save and activate the workflow.
    - `EBS_PROJECT_ID`
    - `EBS_PROJECT_PATH`
 3. **Target properties** (Topology → EBS build instance → DEV environment):
+   - `EBS_DB_NAME` (e.g. `DEVEBS`), unless EBS Source Script is already set
    - `AOL_TOOLS_DIR`
    - `AOL_REPO_DIR`
    - `FD_API_URL`
@@ -370,10 +381,20 @@ For manual testing only. The FlexDeploy workflow does not use it.
 #!/bin/bash
 set -euo pipefail
 
-SINCE="${1:?Usage: get_aol_list.sh YYYY-MM-DD}"
+SINCE="${1:?Usage: get_aol_list.sh YYYY-MM-DD <database_name>}"
 OUT="aol_objects.txt"
 
-. /u01/app/EBSapps.env run     # adjust to your environment file
+# 2nd argument is the database name; the env file is /<db_name>_app/oracle/EBSapps.env
+DB_NAME="${2:?Usage: get_aol_list.sh YYYY-MM-DD <database_name>}"
+EBS_ENV_FILE="/${DB_NAME}${EBS_DIR_SUFFIX-_app}/oracle/EBSapps.env"
+if [ ! -f "$EBS_ENV_FILE" ]; then echo "EBS env file not found: $EBS_ENV_FILE"; exit 1; fi
+
+set +u
+case "$(basename "$EBS_ENV_FILE")" in
+  EBSapps.env) . "$EBS_ENV_FILE" run ;;
+  *)           . "$EBS_ENV_FILE" ;;
+esac
+set -u
 
 # Connecting via /nolog keeps the APPS password out of `ps` output
 sqlplus -s /nolog <<EOF
@@ -398,7 +419,54 @@ set -euo pipefail
 
 # Map to your EBS instance's property codes
 APPS_PWD="${FDEBS_DB_PASSWORD}"
-. "${FDEBS_SOURCE_SCRIPT}"
+
+# EBS environment file. Convention: /<database_name>/oracle/EBSapps.env
+# Resolution order:
+#   1. FDEBS_SOURCE_SCRIPT (EBS instance property "EBS Source Script"), if set
+#   2. DB name taken from the endpoint name postfix + suffix, e.g. ebsapp01-DEVEBS -> DEVEBS_app
+#   3. /${EBS_DB_NAME}${EBS_DIR_SUFFIX}/oracle/EBSapps.env, from the EBS_DB_NAME property
+#   4. Auto-discover, only if exactly one /*_app/oracle/EBSapps.env exists on this server
+EBS_ENV_FILE="${FDEBS_SOURCE_SCRIPT:-}"
+
+# 2. Endpoint-name postfix. Confirm which variable your FlexDeploy exposes with: env | grep '^FD_'
+ENDPOINT_NAME="${FD_ENDPOINT_NAME:-${FD_ENDPOINT_CODE:-}}"
+# Endpoint convention: <machinename>-<DBNAME>; take the text after the LAST separator,
+# then append the directory suffix (default _app)
+SEP="${EBS_ENDPOINT_SEPARATOR:--}"
+SUFFIX="${EBS_DIR_SUFFIX-_app}"
+if [ -z "$EBS_ENV_FILE" ] && [ -n "$ENDPOINT_NAME" ]; then
+  DB_FROM_ENDPOINT="${ENDPOINT_NAME##*"${SEP}"}${SUFFIX}"   # ebsapp01-DEVEBS -> DEVEBS_app
+  CANDIDATE="/${DB_FROM_ENDPOINT}/oracle/EBSapps.env"
+  if [ -f "$CANDIDATE" ]; then
+    EBS_ENV_FILE="$CANDIDATE"
+    echo "DB name '$DB_FROM_ENDPOINT' taken from endpoint '$ENDPOINT_NAME'"
+  else
+    echo "WARN: endpoint '$ENDPOINT_NAME' gives $CANDIDATE, which does not exist"
+  fi
+fi
+
+# 3. Explicit property
+if [ -z "$EBS_ENV_FILE" ] && [ -n "${EBS_DB_NAME:-}" ]; then
+  EBS_ENV_FILE="/${EBS_DB_NAME}${SUFFIX}/oracle/EBSapps.env"
+fi
+if [ -z "$EBS_ENV_FILE" ]; then
+  MATCHES=$(ls -1 /*"${SUFFIX}"/oracle/EBSapps.env 2>/dev/null || true)
+  if [ "$(printf '%s\n' "$MATCHES" | grep -c .)" -eq 1 ]; then
+    EBS_ENV_FILE="$MATCHES"
+  else
+    echo "ERROR: cannot determine EBS env file. Set EBS_DB_NAME for this environment. Found:"
+    printf '%s\n' "$MATCHES"; exit 1
+  fi
+fi
+if [ ! -f "$EBS_ENV_FILE" ]; then echo "ERROR: EBS env file not found: $EBS_ENV_FILE"; exit 1; fi
+
+set +u                                   # EBS env scripts reference unset variables
+case "$(basename "$EBS_ENV_FILE")" in
+  EBSapps.env) . "$EBS_ENV_FILE" run ;;  # 12.2: source the run file system
+  *)           . "$EBS_ENV_FILE" ;;      # 12.1 / APPS<SID>_<host>.env
+esac
+set -u
+echo "Sourced $EBS_ENV_FILE (TWO_TASK=$TWO_TASK)"
 
 cd "$AOL_REPO_DIR"
 git pull -q
